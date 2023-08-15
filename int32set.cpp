@@ -1,24 +1,16 @@
-#include <stdio.h>
-#include <cstdlib>
-#include <cstdint>
 #include <cstring>
-#include <cassert>
-#include <iostream>
-#include <functional>
-#include <future>
-#include <vector>
-#include <iomanip>
-#include <filesystem>
-#include <sys/mman.h>
 #include <fcntl.h>
+#include <future>
+#include <iomanip>
+#include <iostream>
+#include <sys/mman.h>
 #include <sys/stat.h>
-#include <xmmintrin.h>
-#include <thread>
+#include <vector>
 
 using namespace std;
 using namespace std::chrono;
 
-constexpr size_t DATA_SIZE = 0xffffffff;
+constexpr uint64_t DATA_SIZE = uint64_t(UINT32_MAX) + 1;
 
 template<typename F, typename... Args>
 pair<size_t, int64_t> time_func_ms(F func, Args&&... args) {
@@ -32,14 +24,13 @@ void io_stats(F func, Args&&... args) {
     auto result = time_func_ms(func, std::forward<Args>(args)...);
     auto mb = result.first * 0.000001;
     auto seconds = result.second * 0.001;
-    cout << fixed << setprecision(3) << mb << " MB in " << seconds << " seconds" << endl
-         << (mb / seconds) << " MB/s" << endl;
+    cout << fixed << setprecision(3) << mb << " MB in " << seconds << " seconds, " << (mb / seconds) << " MB/s" << endl;
 } 
 
-uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern) {
+uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern, off_t limit = 0, size_t num_readers = 0) {
     auto fd = open(filename, O_RDONLY);
     if(fd < 0) {
-        cerr << "error reading file for reading " << filename << endl;
+        cerr << "error opening file for reading " << filename << endl;
         exit(1);
     }
     struct stat file_stat;
@@ -47,6 +38,7 @@ uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern) {
         cerr << "error getting file stats for " << filename << endl;
         exit(1);
     }
+    auto file_size = limit ? min(file_stat.st_size, limit) : file_stat.st_size;
     if(file_stat.st_size % sizeof(uint32_t) != 0) {
         cerr << "error file is not int32 aligned " << filename << endl;
         exit(1);
@@ -56,14 +48,13 @@ uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern) {
         cerr << "mmap failed " << filename << endl;
         exit(1);
     }
-    auto num_readers = thread::hardware_concurrency();
+    if(num_readers == 0) num_readers = thread::hardware_concurrency();
     auto mapped_file = (const uint32_t*)mapped_ptr;
-    auto elements = file_stat.st_size / sizeof(uint32_t);
+    auto elements = file_size / sizeof(uint32_t);
     auto elements_per_reader = elements / num_readers;
     uint64_t total = 0;
     vector<future<uint64_t>> readers;
-    cout << "reading memory map " << filename << ", file_size=" << file_stat.st_size << " num_readers=" << num_readers << " elements_per_reader=" << elements_per_reader;
-    cout << endl;
+    cout << "reading memory map " << filename << ", file_size=" << file_size << " num_readers=" << num_readers << " elements_per_reader=" << elements_per_reader << endl << flush;
     for(auto reader = 0; reader < num_readers; ++reader) {
         auto reader_offset = reader * elements_per_reader + (reader > 0 ? elements % num_readers : 0);
         auto reader_elements = elements_per_reader + (reader == 0 ? elements % num_readers : 0);
@@ -73,7 +64,7 @@ uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern) {
             auto end = ptr + reader_elements;
             //madvise((void*)ptr, reader_elements * sizeof(uint32_t), MADV_SEQUENTIAL | MADV_WILLNEED);
             while(ptr != end) {
-                __sync_fetch_and_xor(data + *ptr, pattern);
+                __sync_fetch_and_or(data + *ptr, pattern);
                 ptr++;
                 result++;
             }
@@ -83,10 +74,8 @@ uint64_t read_file(const char* filename, uint8_t* data, uint8_t pattern) {
     for(auto &it : readers) {
         it.wait();
         total += it.get() * sizeof(uint32_t);
-        cout << "." << flush;
     }
-    cout << endl;
-    cout << "done " << total << " bytes read" << endl;
+    cout << "done " << total << " bytes read" << endl << flush;
     return total;
 }
 
@@ -110,18 +99,24 @@ size_t write_set(const char* filename, const uint8_t* data, const uint8_t value)
         ptr++;
         i++;
     }
-    cout << "found " << matches << endl;
     cout << "done " << total << " bytes written" << endl;
+    cout << "found " << matches << " distinct values" << endl;
     fclose(fp);
     return total;
 }
 
-int main() {
+int main(int argc, char** argv) {
     auto start = steady_clock::now();
+    off_t limit = argc > 1 ? atoi(argv[1]) * 1024 * 1024 * 1024 : 0;
+    auto readers = argc > 2 ? atoi(argv[2]) : 0;
     uint8_t* data = new uint8_t[DATA_SIZE];
+    if(!data) {
+        cerr << "error allocating data" << endl;
+        exit(1);
+    }
     memset(data, 0, DATA_SIZE);
-    auto a = async([&data]() { io_stats(read_file, "a.bin", data, 0x0f); });
-    auto b = async([&data]() { io_stats(read_file, "b.bin", data, 0xf0); });
+    auto a = async([&data, limit, readers]() { io_stats(read_file, "1.bin", data, 0x0f, limit, readers); });
+    auto b = async([&data, limit, readers]() { io_stats(read_file, "2.bin", data, 0xf0, limit, readers); });
     a.wait();
     b.wait();
     io_stats(write_set, "set.bin", data, 0xff);
